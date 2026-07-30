@@ -1,12 +1,18 @@
 /**
- * s14: Cron Scheduler
- * 定时任务调度：cron 表达式匹配 → 队列交付 → Agent 自动执行
+ * s15: Agent Teams
+ * 多代理团队：Lead 派生队友，队友在后台干活，通过文件邮箱异步通信
  *
- * 在 s13（后台任务）基础上新增：
- *   - CronManager：管理 cron 任务的注册、触发、消费
- *   - cron scheduler 定时器：每 1s 检查是否有 cron 任务该触发
- *   - 双源 Queue Processor：background 通知 + cron 队列共用一个定时器
- *   - 3 个新工具：schedule_cron、list_crons、cancel_cron
+ * 在 s14（定时调度）基础上新增：
+ *   - MessageBus：文件邮箱消息总线（.mailboxes/*.jsonl）
+ *   - TeammateManager：派生/管理后台队友代理
+ *   - 三源 Queue Processor：background 通知 + cron 队列 + lead 收件箱
+ *   - 3 个新工具：spawn_teammate、send_message、check_inbox
+ *
+ * ASCII 流程：
+ *   Lead: cron队列 → messages → prompt → LLM → TOOLS ────→ loop
+ *               ↑                    ↓                       |
+ *               └── inbox ← MessageBus ← teammate.send_message ←┘
+ *   Teammate: inbox → LLM → bash/read/write/send → loop (max 10 turns)
  */
 
 import readline from 'node:readline'
@@ -17,6 +23,8 @@ import { SystemPromptBuilder } from '../persistence/prompt'
 import { TaskManager, TASK_TOOLS, createTaskHandlers } from '../persistence/task-manager'
 import { BackgroundManager } from '../persistence/background'
 import { CronManager, CRON_TOOLS, createCronHandlers, cronMatches } from '../persistence/cron'
+import { MessageBus } from '../team/message-bus'
+import { TeammateManager, TEAM_TOOLS, createTeamHandlers } from '../team/teammate'
 import Anthropic from '@anthropic-ai/sdk'
 import type {
   Message,
@@ -30,7 +38,7 @@ import type {
 // 核心指令
 // ============================================================================
 
-const S14_BASE_SYSTEM = `You are a coding agent at ${WORKDIR}. Use tools to solve tasks.
+const S15_BASE_SYSTEM = `You are a coding agent at ${WORKDIR}. Use tools to solve tasks.
 
 You have a memory system that persists information across sessions.
 When you learn something worth remembering, use save_memory to save it.
@@ -48,7 +56,13 @@ Cron scheduling: use schedule_cron to set up recurring or one-shot timed tasks.
 cron expression is 5-field: minute hour day-of-month month day-of-week.
 Examples: "*/5 * * * *" (every 5 min), "0 9 * * *" (daily 9am), "0 9 * * 1-5" (weekday 9am).
 Set recurring=false for one-shot reminders, durable=true to persist across sessions.
-When a cron job fires, you will receive "[Scheduled] {prompt}" automatically.`
+When a cron job fires, you will receive "[Scheduled] {prompt}" automatically.
+
+Agent teams: you are the Lead. Use spawn_teammate to delegate work to teammates
+running in the background. Teammates have their own tools (bash, read_file,
+write_file, send_message) and report results via send_message to 'lead'.
+Use send_message to give teammates follow-up instructions, check_inbox to read
+their messages. Teammate results also arrive automatically via "[Inbox]" messages.`
 
 // ============================================================================
 // Session Context
@@ -61,6 +75,8 @@ interface SessionContext {
   promptBuilder: SystemPromptBuilder
   bgManager: BackgroundManager
   cronManager: CronManager
+  bus: MessageBus
+  teammateManager: TeammateManager
 
   // 并发控制
   isIdle: () => boolean
@@ -75,19 +91,23 @@ interface SessionContext {
 }
 
 // ============================================================================
-// Queue Processor（双源：background + cron）
+// Queue Processor（三源：background + cron + lead 收件箱）
 // ============================================================================
 
 function processQueue(ctx: SessionContext): void {
   if (!ctx.isIdle()) return
-  // 双源：后台完成 或 cron 队列有任务，都触发 agent turn
-  if (!ctx.bgManager.hasCompleted() && !ctx.cronManager.hasQueue()) return
+  // 三源：后台完成 或 cron 队列有任务 或 lead 收件箱有信，都触发 agent turn
+  // 注意：唤醒条件只看 bus.peek，不看 teammateManager.hasActive——
+  // 队友发完 result 才注销，result 消息可能比注册表条目活得更久
+  if (!ctx.bgManager.hasCompleted() && !ctx.cronManager.hasQueue() && !ctx.bus.peek('lead')) {
+    return
+  }
 
   console.log('\n  \x1b[35m[queue processor] delivering work\x1b[0m')
   ctx.setBusy()
 
   runAgentTurn(ctx).then(() => {
-    console.log('\x1b[36ms14 >> \x1b[0m')
+    console.log('\x1b[36ms15 >> \x1b[0m')
     ctx.setIdle()
     ctx.checkQueueStop()
   })
@@ -98,16 +118,23 @@ function processQueue(ctx: SessionContext): void {
 // ============================================================================
 
 async function runAgentTurn(ctx: SessionContext): Promise<void> {
-  // 注入之前积攒的通知（后台完成 + cron 触发）
+  // 注入之前积攒的异步消息（后台完成 + cron 触发 + 队友来信）
   const notifications = ctx.bgManager.collectResults()
   const firedJobs = ctx.cronManager.consumeQueue()
+  const inbox = ctx.bus.readInbox('lead')
 
-  if (notifications.length > 0 || firedJobs.length > 0) {
+  if (notifications.length > 0 || firedJobs.length > 0 || inbox.length > 0) {
     const parts: string[] = []
     for (const notif of notifications) parts.push(notif)
     for (const job of firedJobs) {
       parts.push(`[Scheduled] ${job.prompt}`)
       console.log(`  \x1b[35m[inject cron] ${job.prompt.slice(0, 50)}\x1b[0m`)
+    }
+    if (inbox.length > 0) {
+      parts.push(
+        '[Inbox]\n' + inbox.map((m) => `From ${m.from}: ${m.content.slice(0, 200)}`).join('\n'),
+      )
+      console.log(`  \x1b[33m[inject inbox] ${inbox.length} message(s)\x1b[0m`)
     }
     ctx.history.push({ role: 'user', content: parts.join('\n') })
   }
@@ -137,7 +164,7 @@ async function runAgentTurn(ctx: SessionContext): Promise<void> {
       break
     }
 
-    // 执行工具（同步/后台两条路径，和 s13 一致）
+    // 执行工具（同步/后台两条路径，和 s14 一致）
     const results: (ToolResultBlock | { type: 'text'; text: string })[] = []
 
     for (const block of response.content) {
@@ -223,6 +250,8 @@ async function main(): Promise<void> {
   const taskManager = new TaskManager()
   const bgManager = new BackgroundManager()
   const cronManager = new CronManager()
+  const bus = new MessageBus()
+  const teammateManager = new TeammateManager(bus)
 
   // 2. 加载持久化的 cron 任务
   cronManager.loadDurable()
@@ -232,17 +261,17 @@ async function main(): Promise<void> {
   memoryManager.loadAll()
 
   // 4. 创建 SystemPromptBuilder
-  const allTools = [...BASE_TOOLS, ...TASK_TOOLS, ...CRON_TOOLS]
+  const allTools = [...BASE_TOOLS, ...TASK_TOOLS, ...CRON_TOOLS, ...TEAM_TOOLS]
   const promptBuilder = new SystemPromptBuilder({
     tools: allTools,
     memoryManager,
-    baseSystem: S14_BASE_SYSTEM,
+    baseSystem: S15_BASE_SYSTEM,
   })
 
   // 5. 显示启动信息
   const fullPrompt = promptBuilder.build()
   console.log(`[System prompt: ${fullPrompt.length} chars]`)
-  console.log('[Task system + background execution + cron scheduling enabled]')
+  console.log('[Task system + background execution + cron scheduling + agent teams enabled]')
   if (memoryManager.memories.size > 0) {
     console.log(`[${memoryManager.memories.size} memories loaded]`)
   } else {
@@ -266,6 +295,8 @@ async function main(): Promise<void> {
 
     ...createTaskHandlers(taskManager),
     ...createCronHandlers(cronManager),
+    // onSpawn: 队友开跑后要确保 queue processor 在跑，否则没人拾取 result 消息
+    ...createTeamHandlers(bus, teammateManager, { onSpawn: () => ensureQueue() }),
   }
 
   // 7. 消息历史 + 空闲状态 + 定时器管理
@@ -290,10 +321,13 @@ async function main(): Promise<void> {
 
   const checkQueueStop = () => {
     if (!queueTimer) return
-    // 三种情况不停：运行中的后台任务、未交付的后台通知、未交付的 cron 任务
+    // 四种情况不停：运行中的后台任务、未交付的后台通知、未交付的 cron 任务、
+    // 活跃队友或 lead 收件箱有未读消息（队友随时可能来信）
     if (bgManager.listRunning().length > 0) return
     if (bgManager.hasCompleted()) return
     if (cronManager.hasQueue()) return
+    if (teammateManager.hasActive()) return
+    if (bus.peek('lead')) return
     clearInterval(queueTimer)
     queueTimer = null
     console.log('  \x1b[35m[queue processor] stopped\x1b[0m')
@@ -307,6 +341,8 @@ async function main(): Promise<void> {
     promptBuilder,
     bgManager,
     cronManager,
+    bus,
+    teammateManager,
     isIdle,
     setBusy,
     setIdle,
@@ -339,11 +375,12 @@ async function main(): Promise<void> {
   console.log('  \x1b[35m[cron] scheduler started\x1b[0m')
 
   // 10. REPL 主循环
+  let hadTeammates = false
   while (true) {
     let query: string
     try {
       query = await new Promise<string>((resolve, reject) => {
-        rl.question('\x1b[36ms14 >> \x1b[0m', (answer) => {
+        rl.question('\x1b[36ms15 >> \x1b[0m', (answer) => {
           if (answer === undefined) reject(new Error('EOF'))
           else resolve(answer)
         })
@@ -365,7 +402,7 @@ async function main(): Promise<void> {
     if (query.trim() === '/help') {
       console.log('Commands:')
       console.log('  /help      - Show this help message')
-      console.log('  /status    - Show task, background, and cron status')
+      console.log('  /status    - Show task, background, cron, and team status')
       console.log('  q/exit     - Exit the session')
       continue
     }
@@ -391,6 +428,11 @@ async function main(): Promise<void> {
         const tag = job.recurring ? 'recurring' : 'one-shot'
         console.log(`    ${job.id}: '${job.cron}' → ${job.prompt.slice(0, 30)} [${tag}]`)
       }
+      const teammates = teammateManager.listActive()
+      console.log(`  Teammates: ${teammates.length} active`)
+      for (const name of teammates) {
+        console.log(`    ${name}`)
+      }
       continue
     }
 
@@ -407,6 +449,14 @@ async function main(): Promise<void> {
 
     setIdle()
     checkQueueStop()
+
+    // 所有队友完成且输出已交付时，提示一次
+    if (teammateManager.hasActive()) {
+      hadTeammates = true
+    } else if (hadTeammates && !bus.peek('lead') && !bgManager.hasCompleted()) {
+      console.log('\x1b[32m[all teammates done]\x1b[0m')
+      hadTeammates = false
+    }
   }
 
   // 清理

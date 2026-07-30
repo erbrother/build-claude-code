@@ -85,7 +85,7 @@ export class BackgroundManager {
    * 返回 bg_id 用于追踪
    */
   startTask(toolName: string, toolInput: Record<string, unknown>): string {
-    const bgId = `bg_${String(++this.counter).padStart(4, '0')}`
+    const bgId = `bg_${String(++this.counter).padStart(4, '0')}` // 0001
     const command = (toolInput.command as string) || toolName
 
     // 记录任务
