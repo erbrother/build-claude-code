@@ -25,8 +25,9 @@ export interface BusMessage {
   from: string // 发送方 agent 名
   to: string // 接收方 agent 名
   content: string // 消息内容
-  type: string // "message" | "result"
+  type: string // "message" | "result" | 协议类型（s16: shutdown_request 等）
   ts: number // 发送时间戳（秒）
+  metadata?: Record<string, unknown> // s16: 协议元数据（request_id / approve）
 }
 
 // ============================================================================
@@ -73,11 +74,23 @@ export class MessageBus {
   /**
    * 发信：追加一行 JSON 到接收方收件箱
    * append 是原子的（单行小消息），教学版不加锁
+   *
+   * @param type     消息类型："message" 普通消息（默认）；
+   *                 s16 协议消息如 shutdown_request / plan_approval_response
+   * @param metadata 协议元数据，如 { request_id, approve }（s16）
    */
-  send(from: string, to: string, content: string, type: string = 'message'): void {
-    const msg: BusMessage = { from, to, content, type, ts: Date.now() / 1000 }
+  send(
+    from: string,
+    to: string,
+    content: string,
+    type: string = 'message',
+    metadata?: Record<string, unknown>,
+  ): void {
+    const msg: BusMessage = { from, to, content, type, ts: Date.now() / 1000, metadata }
     fs.appendFileSync(this.inboxPath(to), JSON.stringify(msg) + '\n', 'utf-8')
-    console.log(`  \x1b[33m[bus] ${from} → ${to}: ${content.slice(0, PRINT_LIMIT)}\x1b[0m`)
+    console.log(
+      `  \x1b[33m[bus] ${from} → ${to}: (${type}) ${content.slice(0, PRINT_LIMIT)}\x1b[0m`,
+    )
   }
 
   /**
