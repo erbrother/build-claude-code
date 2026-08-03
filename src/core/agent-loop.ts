@@ -39,6 +39,36 @@ export const client = new Anthropic({
 })
 
 // ============================================================================
+// 工具调用判断（兼容不同 API 网关）
+// ============================================================================
+
+/**
+ * 判断响应内容里是否含 tool_use 块
+ *
+ * 为什么不用 response.stop_reason === 'tool_use'？
+ * Anthropic 官方 API 返回 stop_reason='tool_use'，但部分兼容网关
+ * （如 openresty 转发）返回别的值——模型明明调了工具，stop_reason 却是
+ * end_turn。如果按 stop_reason 判断，tool_use 块会被当成"模型结束"丢进历史，
+ * 下一次请求就报 "tool_use ids found without tool_result blocks" 400 错误。
+ * 所以统一按内容判断：有 tool_use 块就是没结束。
+ */
+export function hasToolUseBlocks(content: unknown): boolean {
+  if (!Array.isArray(content)) return false
+  return content.some((block) => block.type === 'tool_use')
+}
+
+/**
+ * 判断响应是否为"空 tool_use"：stop_reason 说要用工具，但内容里没有 tool_use 块
+ * （部分网关的兼容问题）。此时没有工具可执行，直接退出，避免死循环。
+ */
+export function isEmptyToolUseResponse(response: {
+  stop_reason?: string | null
+  content: unknown
+}): boolean {
+  return response.stop_reason === 'tool_use' && !hasToolUseBlocks(response.content)
+}
+
+// ============================================================================
 // Agent Loop Options
 // ============================================================================
 

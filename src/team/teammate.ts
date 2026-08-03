@@ -16,7 +16,7 @@
 
 import { exec } from 'node:child_process'
 import { promisify } from 'node:util'
-import { client, MODEL, WORKDIR } from '../core/agent-loop'
+import { client, MODEL, WORKDIR, hasToolUseBlocks } from '../core/agent-loop'
 import { runRead, runWrite } from '../core/tools'
 import { MessageBus } from './message-bus'
 import type { BusMessage } from './message-bus'
@@ -239,7 +239,8 @@ export class TeammateManager {
 
       messages.push({ role: 'assistant', content: response.content })
 
-      if (response.stop_reason !== 'tool_use') {
+      // 按内容判断是否还有工具调用（兼容 stop_reason 不可靠的网关）
+      if (!hasToolUseBlocks(response.content)) {
         break // 模型决定停止
       }
 
@@ -334,7 +335,8 @@ export class TeammateManager {
 
       messages.push({ role: 'assistant', content: response.content })
 
-      if (response.stop_reason !== 'tool_use') {
+      // 按内容判断是否还有工具调用（兼容 stop_reason 不可靠的网关）
+      if (!hasToolUseBlocks(response.content)) {
         // idle 等待：轮询收件箱，直到有新消息（回到 LLM turn）或 shutdown
         // 真实 CC 这里会发 idle_notification 给 Lead
         while (!shutdown) {

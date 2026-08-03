@@ -17,7 +17,7 @@
  */
 
 import readline from 'node:readline'
-import { client, MODEL, WORKDIR } from '../core/agent-loop'
+import { client, MODEL, WORKDIR, hasToolUseBlocks } from '../core/agent-loop'
 import { BASE_TOOLS, BASE_HANDLERS } from '../core/tools'
 import { MemoryManager, MEMORY_GUIDANCE } from '../persistence/memory'
 import { SystemPromptBuilder } from '../persistence/prompt'
@@ -177,7 +177,8 @@ async function runAgentTurn(ctx: SessionContext): Promise<void> {
       content: response.content as ContentBlock[],
     })
 
-    if (response.stop_reason !== 'tool_use') {
+    // 按内容判断是否还有工具调用（兼容 stop_reason 不可靠的网关）
+    if (!hasToolUseBlocks(response.content)) {
       break
     }
 
