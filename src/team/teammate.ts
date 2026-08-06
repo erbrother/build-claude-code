@@ -1,17 +1,19 @@
 /**
- * s15 Agent Teams / s16 Team Protocols - Teammate
+ * s15 Agent Teams / s16 Team Protocols / s17 Autonomous Agents - Teammate
  * 队友代理：后台运行的简化 Agent，通过 MessageBus 和 Lead 通信
  *
  * 对标原项目 s15_agent_teams/code.py 的 spawn_teammate_thread + 团队工具
  *      s16_team_protocols/code.py 的 idle loop + 协议分发 + submit_plan
+ *      s17_autonomous_agents/code.py 的 WORK/IDLE 生命周期 + 自动认领
  * 差异：原项目用 threading.Thread 跑队友，Node.js 单线程用 async 函数挂到事件循环
  *       原项目队友 bash 用同步 subprocess（线程里不阻塞主循环），
  *       我们用异步 exec（否则会阻塞整个进程，Lead 的 REPL 会卡住）
  *
- * 两种运行模式（构造时选择）：
+ * 三种运行模式（构造时选择）：
  *   rounds（默认，s15）：最多跑 10 轮就退出汇报
  *   idle（s16）：模型停下来后不退出，轮询收件箱等指令/协议消息，
  *               直到收到 shutdown_request 才退出
+ *   autonomous（s17）：WORK → IDLE → 自动认领任务，60s 无事件自动退出
  */
 
 import { exec } from 'node:child_process'
@@ -21,6 +23,7 @@ import { runRead, runWrite } from '../core/tools'
 import { MessageBus } from './message-bus'
 import type { BusMessage } from './message-bus'
 import { ProtocolManager } from './protocols'
+import type { TaskManager } from '../persistence/task-manager'
 import type { ContentBlock, ToolDefinition, ToolHandler } from '../core/types'
 
 const execAsync = promisify(exec)
@@ -47,6 +50,15 @@ const OUTPUT_LIMIT = 50_000
 
 /** idle 模式收件箱轮询间隔（毫秒） */
 const IDLE_POLL_INTERVAL = 1000
+
+/** s17: 自主模式 IDLE 阶段轮询间隔（毫秒）——教学版 5s，可测试性优先 */
+const AUTONOMOUS_IDLE_POLL_INTERVAL = 5_000
+
+/** s17: 自主模式 IDLE 阶段无事件超时（毫秒）——教学版 60s */
+const AUTONOMOUS_IDLE_TIMEOUT = 60_000
+
+/** s17: WORK 阶段最大连续轮数（一轮 IDLE 后重置） */
+const MAX_WORK_TURNS = 10
 
 /** 队友侧需要分发的协议消息类型 */
 const TEAMMATE_PROTOCOL_TYPES = ['shutdown_request', 'plan_approval_response']
@@ -118,6 +130,37 @@ const SUBMIT_PLAN_TOOL: ToolDefinition = {
   },
 }
 
+/** s17: 队友的任务板工具（autonomous 模式追加，列表/认领/完成） */
+const TEAMMATE_TASK_TOOLS: ToolDefinition[] = [
+  {
+    name: 'list_tasks',
+    description: 'List all tasks on the board.',
+    input_schema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'claim_task',
+    description: 'Claim a pending task.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        task_id: { type: 'string', description: 'Task ID to claim' },
+      },
+      required: ['task_id'],
+    },
+  },
+  {
+    name: 'complete_task',
+    description: 'Mark an in-progress task as completed.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        task_id: { type: 'string', description: 'Task ID to complete' },
+      },
+      required: ['task_id'],
+    },
+  },
+]
+
 // ============================================================================
 // 运行模式选项
 // ============================================================================
@@ -125,12 +168,15 @@ const SUBMIT_PLAN_TOOL: ToolDefinition = {
 export interface TeammateOptions {
   /**
    * 运行模式：
-   *   false（默认，s15）：最多 MAX_TEAMMATE_TURNS 轮后退出汇报
-   *   true（s16）：模型停下后轮询收件箱等指令，直到收到 shutdown_request
+   *   rounds（默认，s15）：最多 MAX_TEAMMATE_TURNS 轮后退出汇报
+   *   idle（s16）：模型停下后轮询收件箱等指令，直到收到 shutdown_request
+   *   autonomous（s17）：WORK → IDLE → 自动认领任务，60s 无事件自动退出
    */
-  idle?: boolean
-  /** s16: 协议管理器（idle 模式必需，submit_plan 要注册审批请求） */
+  mode?: 'rounds' | 'idle' | 'autonomous'
+  /** s16: 协议管理器（idle/autonomous 模式必需，submit_plan 要注册审批请求） */
   protocolManager?: ProtocolManager
+  /** s17: 任务管理器（autonomous 模式必需，IDLE 阶段扫描任务板自动认领） */
+  taskManager?: TaskManager
 }
 
 // ============================================================================
@@ -170,7 +216,17 @@ export class TeammateManager {
 
     this.active.set(name, true)
     // fire-and-forget：挂到事件循环，不阻塞 Lead
-    const loop = this.options.idle ? this.runIdle(name, role, prompt) : this.run(name, role, prompt)
+    let loop: Promise<void>
+    switch (this.options.mode ?? 'rounds') {
+      case 'idle':
+        loop = this.runIdle(name, role, prompt)
+        break
+      case 'autonomous':
+        loop = this.runAutonomous(name, role, prompt)
+        break
+      default:
+        loop = this.run(name, role, prompt)
+    }
     void loop.catch((err) => {
       console.log(`  \x1b[31m[teammate] ${name} crashed: ${(err as Error).message}\x1b[0m`)
       this.bus.send(name, 'lead', `Error: ${(err as Error).message}`, 'result')
@@ -372,6 +428,215 @@ export class TeammateManager {
     this.bus.send(name, 'lead', summary, 'result')
     this.active.delete(name)
     console.log(`  \x1b[32m[teammate] ${name} finished\x1b[0m`)
+  }
+
+  // ==========================================================================
+  // 队友的 autonomous agent loop（s17：WORK → IDLE 生命周期）
+  // ==========================================================================
+
+  /**
+   * autonomous 模式：队友自主发现工作，不再只等 Lead 派活
+   *
+   * 生命周期（对标原项目）：
+   *   WORK:  inbox → LLM → tools → 模型停下或 10 轮 → 进入 IDLE
+   *   IDLE:  每 5s 轮询（收件箱 + 任务板）→ 有信/有活 → 回 WORK
+   *          60s 无事件 → 自动退出（不占资源）
+   *
+   * 和 idle 模式的区别：idle 模式只等 Lead 指令，没指令就无限等；
+   * autonomous 模式会自己扫描任务板认领"待认领"任务——真正的自主代理。
+   *
+   * 身份再注入：每轮 WORK 开始前，如果上下文很短（可能刚被压缩过），
+   * 注入 <identity> 提醒队友"你是谁、在干嘛"（对标原项目 s17 改动）。
+   */
+  private async runAutonomous(name: string, role: string, prompt: string): Promise<void> {
+    const protocolManager = this.options.protocolManager
+    const taskManager = this.options.taskManager
+    if (!protocolManager || !taskManager) {
+      throw new Error('autonomous mode requires protocolManager and taskManager')
+    }
+
+    const system =
+      `You are '${name}', a ${role}. ` +
+      'Use tools to complete tasks. ' +
+      'You can list and claim tasks from the board. ' +
+      'Check inbox for protocol messages. ' +
+      "Send results via send_message to 'lead'."
+
+    const messages: { role: 'user' | 'assistant'; content: unknown }[] = [
+      { role: 'user', content: prompt },
+    ]
+
+    // autonomous 模式 = 基础工具 + submit_plan + 任务板工具（共 8 个）
+    const tools = [...TEAMMATE_TOOLS, SUBMIT_PLAN_TOOL, ...TEAMMATE_TASK_TOOLS]
+    const handlers: Record<string, ToolHandler> = {
+      bash: this.runBash,
+      read_file: runRead,
+      write_file: runWrite,
+      send_message: (input) => {
+        this.bus.send(name, input.to as string, input.content as string)
+        return 'Sent'
+      },
+      submit_plan: (input) => {
+        const plan = input.plan as string
+        const state = protocolManager.createRequest('plan_approval', name, 'lead', plan)
+        this.bus.send(name, 'lead', plan, 'plan_approval_request', {
+          request_id: state.requestId,
+        })
+        return `Plan submitted (${state.requestId}). Waiting for approval...`
+      },
+      list_tasks: async () => {
+        const tasks = await taskManager.listAll()
+        if (tasks.length === 0) return 'No tasks.'
+        return tasks
+          .map((t) => `  ${t.id}: ${t.subject} [${t.status}]${t.owner ? ` (${t.owner})` : ''}`)
+          .join('\n')
+      },
+      claim_task: async (input) => {
+        return taskManager.claimTask(input.task_id as string, name)
+      },
+      complete_task: async (input) => {
+        return taskManager.completeTask(input.task_id as string)
+      },
+    }
+
+    // 外层循环：WORK → IDLE 周而复始
+    while (true) {
+      // 身份再注入（s17）：上下文太短说明刚起步或被压缩过
+      if (messages.length <= 3) {
+        messages.unshift({
+          role: 'user',
+          content: `<identity>You are '${name}', role: ${role}. Continue your work.</identity>`,
+        })
+      }
+
+      // ── WORK 阶段：最多 MAX_WORK_TURNS 轮 ──
+      let shutdown = false
+      for (let turn = 0; turn < MAX_WORK_TURNS; turn++) {
+        // 收信 + 协议分发
+        const inbox = this.bus.readInbox(name)
+        const nonProtocol = this.dispatchInbox(name, inbox, messages)
+        if (nonProtocol === null) {
+          shutdown = true
+          break
+        }
+        if (nonProtocol.length > 0) {
+          messages.push({ role: 'user', content: `<inbox>${JSON.stringify(nonProtocol)}</inbox>` })
+        }
+
+        let response
+        try {
+          response = await client.messages.create({
+            model: MODEL,
+            system,
+            messages: messages.slice(-TEAMMATE_CONTEXT_LIMIT) as never,
+            tools: tools as never,
+            max_tokens: 8000,
+          })
+        } catch {
+          break // API 错误：直接退出
+        }
+
+        messages.push({ role: 'assistant', content: response.content })
+
+        // 模型决定停止（没有工具调用）→ WORK 结束，进入 IDLE
+        if (!hasToolUseBlocks(response.content)) {
+          break
+        }
+
+        messages.push({
+          role: 'user',
+          content: await this.executeToolCalls(response.content, handlers),
+        })
+      }
+
+      if (shutdown) break
+
+      // ── IDLE 阶段（s17）：扫描收件箱 + 任务板 ──
+      const idleResult = await this.idlePoll(name, messages)
+      if (idleResult === 'shutdown' || idleResult === 'timeout') {
+        break
+      }
+      // idleResult === 'work' → 回到 WORK 阶段
+    }
+
+    // 提取最后的文本作为总结，汇报给 Lead
+    const summary = this.extractSummary(messages)
+    this.bus.send(name, 'lead', summary, 'result')
+    this.active.delete(name)
+    console.log(`  \x1b[32m[teammate] ${name} finished\x1b[0m`)
+  }
+
+  /**
+   * IDLE 阶段轮询：收件箱 + 任务板双源
+   * 返回 'work'（有新工作）、'shutdown'（收到关闭协议）、'timeout'（无事件超时）
+   *
+   * 顺序很重要：先收件箱（Lead 指令优先），再任务板（自主认领）。
+   * 收件箱里的 shutdown_request 必须最先处理——Lead 要关人，不能让它等。
+   */
+  private async idlePoll(
+    name: string,
+    messages: { role: 'user' | 'assistant'; content: unknown }[],
+  ): Promise<'work' | 'shutdown' | 'timeout'> {
+    const taskManager = this.options.taskManager!
+    const rounds = AUTONOMOUS_IDLE_TIMEOUT / AUTONOMOUS_IDLE_POLL_INTERVAL
+
+    for (let i = 0; i < rounds; i++) {
+      await new Promise((r) => setTimeout(r, AUTONOMOUS_IDLE_POLL_INTERVAL))
+
+      // 1. 收件箱：协议消息就地处理，普通消息 → 回到 WORK
+      const inbox = this.bus.readInbox(name)
+      if (inbox.length > 0) {
+        const nonProtocol = this.dispatchInbox(name, inbox, messages)
+        if (nonProtocol === null) {
+          console.log(`  \x1b[35m[protocol] ${name} approved shutdown in idle\x1b[0m`)
+          return 'shutdown'
+        }
+        if (nonProtocol.length > 0) {
+          messages.push({
+            role: 'user',
+            content: `<inbox>${JSON.stringify(nonProtocol)}</inbox>`,
+          })
+          console.log(`  \x1b[36m[idle] ${name} found inbox messages\x1b[0m`)
+          return 'work'
+        }
+        // 全是协议消息且未触发停止（如 plan_approval_response）→ 继续轮询
+      }
+
+      // 2. 任务板：扫描待认领任务，认领成功 → 回到 WORK
+      const unclaimed = await this.scanUnclaimedTasks(taskManager)
+      if (unclaimed.length > 0) {
+        const task = unclaimed[0]
+        const result = await taskManager.claimTask(task.id, name)
+        if (result.startsWith('Claimed')) {
+          messages.push({
+            role: 'user',
+            content: `<auto-claimed>Task ${task.id}: ${task.subject}</auto-claimed>`,
+          })
+          console.log(`  \x1b[32m[idle] ${name} auto-claimed: ${task.subject}\x1b[0m`)
+          return 'work'
+        }
+        console.log(`  \x1b[33m[idle] ${name} claim failed: ${result}\x1b[0m`)
+      }
+    }
+
+    console.log(`  \x1b[31m[idle] ${name} timeout (${AUTONOMOUS_IDLE_TIMEOUT / 1000}s)\x1b[0m`)
+    return 'timeout'
+  }
+
+  /**
+   * 扫描任务板：找"pending + 无 owner + 依赖已完成"的任务
+   * 这是自主性的核心——队友认领的不是 Lead 派的活，是自己发现的活
+   */
+  private async scanUnclaimedTasks(taskManager: TaskManager) {
+    const tasks = await taskManager.listAll()
+    const unclaimed = []
+    for (const task of tasks) {
+      if (task.status !== 'pending' || task.owner) continue
+      if (await taskManager.canStart(task.id)) {
+        unclaimed.push(task)
+      }
+    }
+    return unclaimed
   }
 
   /**

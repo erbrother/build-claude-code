@@ -1,19 +1,18 @@
 /**
- * s16: Team Protocols
- * 团队协议：Lead 和队友之间的请求-响应握手（shutdown 关闭 + plan 审批）
+ * s17: Autonomous Agents
+ * 自主代理：队友不再只等 Lead 派活，IDLE 阶段自动扫描任务板认领任务
  *
- * 在 s15（多代理团队）基础上新增：
- *   - ProtocolManager：pending_requests 注册表 + 响应匹配状态机
- *   - BusMessage 增加 metadata：协议消息携带 request_id / approve
- *   - consumeLeadInbox：统一的收件箱消费（读信 + 协议路由）
- *   - 队友 idle 模式：干完活不退出，等指令直到 shutdown_request
- *   - 3 个新 Lead 工具：request_shutdown、request_plan、review_plan
- *   - 1 个新队友工具：submit_plan
+ * 在 s16（团队协议）基础上新增：
+ *   - TeammateManager 的 autonomous 模式：WORK → IDLE → SHUTDOWN 生命周期
+ *   - scanUnclaimedTasks：找"pending + 无 owner + 依赖已完成"的任务
+ *   - idlePoll：IDLE 阶段双源轮询（收件箱 + 任务板），60s 无事件自动退出
+ *   - 队友工具从 5 个扩到 8 个：+ list_tasks、claim_task、complete_task
+ *   - claim_task 增加 owner 检查（防止两个队友抢同一个任务）
+ *   - 身份再注入：上下文被压缩后重新提醒队友"你是谁、在干嘛"
  *
- * ASCII 流程：
- *   Lead: bus.send("shutdown_request", {request_id}) ──────→ teammate 收件箱
- *   Teammate: dispatch → bus.send("shutdown_response", {request_id, approve}) ─→ Lead 收件箱
- *   Lead: consumeLeadInbox → matchResponse(request_id) → pending[rid].status = approved
+ * ASCII 生命周期：
+ *   WORK: inbox → LLM → tools → (tool_use? 继续) → (停下? → IDLE)
+ *   IDLE: 5s 轮询 → 有信? → WORK / 有待认领? → claim → WORK / 60s? → SHUTDOWN
  */
 
 import readline from 'node:readline'
@@ -45,7 +44,7 @@ import type {
 // 核心指令
 // ============================================================================
 
-const S16_BASE_SYSTEM = `You are a coding agent at ${WORKDIR}. Use tools to solve tasks.
+const S17_BASE_SYSTEM = `You are a coding agent at ${WORKDIR}. Use tools to solve tasks.
 
 You have a memory system that persists information across sessions.
 When you learn something worth remembering, use save_memory to save it.
@@ -65,11 +64,14 @@ Examples: "*/5 * * * *" (every 5 min), "0 9 * * *" (daily 9am), "0 9 * * 1-5" (w
 Set recurring=false for one-shot reminders, durable=true to persist across sessions.
 When a cron job fires, you will receive "[Scheduled] {prompt}" automatically.
 
-Agent teams: you are the Lead. Use spawn_teammate to delegate work to teammates
-running in the background. Teammates have their own tools (bash, read_file,
-write_file, send_message, submit_plan) and stay alive until you shut them down.
-Use send_message to give teammates follow-up instructions, check_inbox to read
-their messages.
+Agent teams: you are the Lead. Use spawn_teammate to delegate work to teammates.
+Teammates are AUTONOMOUS: after finishing assigned work they enter IDLE and
+scan the task board, auto-claiming pending tasks whose dependencies are done.
+Teammates have their own tools (bash, read_file, write_file, send_message,
+submit_plan, list_tasks, claim_task, complete_task). They stay alive until
+shut down or idle-timeout after 60s without work.
+Use create_task to put work on the board — teammates will pick it up by
+themselves. Use request_shutdown to close a teammate gracefully.
 
 Team protocols (request-response handshakes, correlated by request_id):
 - request_shutdown: ask a teammate to shut down gracefully. The teammate
@@ -77,8 +79,7 @@ Team protocols (request-response handshakes, correlated by request_id):
 - request_plan: ask a teammate to submit a plan before acting. It will call
   submit_plan, which arrives in your inbox as a plan_approval_request.
 - review_plan: approve or reject a submitted plan by request_id. The teammate
-  receives the verdict and proceeds (approved) or revises (rejected).
-Always shut teammates down with request_shutdown when their work is done.`
+  receives the verdict and proceeds (approved) or revises (rejected).`
 
 // ============================================================================
 // Session Context
@@ -122,7 +123,7 @@ function processQueue(ctx: SessionContext): void {
   ctx.setBusy()
 
   runAgentTurn(ctx).then(() => {
-    console.log('\x1b[36ms16 >> \x1b[0m')
+    console.log('\x1b[36ms17 >> \x1b[0m')
     ctx.setIdle()
     ctx.checkQueueStop()
   })
@@ -134,8 +135,7 @@ function processQueue(ctx: SessionContext): void {
 
 async function runAgentTurn(ctx: SessionContext): Promise<void> {
   // 注入之前积攒的异步消息（后台完成 + cron 触发 + 队友来信）
-  // 注意：收件箱必须走 consumeLeadInbox——协议响应要路由进状态机，
-  // 否则 shutdown_response / plan_approval_response 会被当普通消息吞掉
+  // 收件箱走 consumeLeadInbox——协议响应要先路由进状态机
   const notifications = ctx.bgManager.collectResults()
   const firedJobs = ctx.cronManager.consumeQueue()
   const inbox = consumeLeadInbox(ctx.bus, ctx.protocolManager)
@@ -182,7 +182,7 @@ async function runAgentTurn(ctx: SessionContext): Promise<void> {
       break
     }
 
-    // 执行工具（同步/后台两条路径，和 s15 一致）
+    // 执行工具（同步/后台两条路径，和 s16 一致）
     const results: (ToolResultBlock | { type: 'text'; text: string })[] = []
 
     for (const block of response.content) {
@@ -218,14 +218,11 @@ async function runAgentTurn(ctx: SessionContext): Promise<void> {
       }
     }
 
-    // 收集本轮后台通知，合并进同一条 user 消息
-    // 注意顺序：tool_result 必须紧跟对应的 tool_use（API 硬性要求），
-    // 通知文本只能放 tool_result 之后，unshift 到最前会导致
-    // "tool_use ids were found without tool_result blocks" 400 错误
+    // 收集本轮后台通知，合入同一条 user 消息
     const bgNotifications = ctx.bgManager.collectResults()
     if (bgNotifications.length > 0) {
       for (const notif of bgNotifications) {
-        results.push({ type: 'text', text: notif })
+        results.unshift({ type: 'text', text: notif })
       }
     }
 
@@ -273,8 +270,12 @@ async function main(): Promise<void> {
   const cronManager = new CronManager()
   const bus = new MessageBus()
   const protocolManager = new ProtocolManager()
-  // s16: 队友用 idle 模式（等指令直到 shutdown_request），需要 protocolManager
-  const teammateManager = new TeammateManager(bus, { mode: 'idle', protocolManager })
+  // s17: 队友用 autonomous 模式（WORK → IDLE → 自动认领），需要协议 + 任务管理器
+  const teammateManager = new TeammateManager(bus, {
+    mode: 'autonomous',
+    protocolManager,
+    taskManager,
+  })
 
   // 2. 加载持久化的 cron 任务
   cronManager.loadDurable()
@@ -288,13 +289,13 @@ async function main(): Promise<void> {
   const promptBuilder = new SystemPromptBuilder({
     tools: allTools,
     memoryManager,
-    baseSystem: S16_BASE_SYSTEM,
+    baseSystem: S17_BASE_SYSTEM,
   })
 
   // 5. 显示启动信息
   const fullPrompt = promptBuilder.build()
   console.log(`[System prompt: ${fullPrompt.length} chars]`)
-  console.log('[Task system + background + cron + agent teams + team protocols enabled]')
+  console.log('[Task system + background + cron + agent teams + protocols + autonomous enabled]')
   if (memoryManager.memories.size > 0) {
     console.log(`[${memoryManager.memories.size} memories loaded]`)
   } else {
@@ -321,8 +322,7 @@ async function main(): Promise<void> {
     ...createTeamHandlers(bus, teammateManager, { onSpawn: () => ensureQueue() }),
     ...createProtocolHandlers(bus, protocolManager),
 
-    // s16: 覆盖 s15 的 check_inbox——协议感知版本，
-    // 协议响应必须路由进状态机，不能当普通消息吞掉
+    // 协议感知的 check_inbox（和 s16 一致）
     check_inbox: () => {
       const msgs = consumeLeadInbox(bus, protocolManager)
       if (msgs.length === 0) return '(inbox empty)'
@@ -359,7 +359,7 @@ async function main(): Promise<void> {
   const checkQueueStop = () => {
     if (!queueTimer) return
     // 四种情况不停：运行中的后台任务、未交付的后台通知、未交付的 cron 任务、
-    // 活跃队友或 lead 收件箱有未读消息（idle 队友随时可能来信）
+    // 活跃队友或 lead 收件箱有未读消息（autonomous 队友随时可能来信）
     if (bgManager.listRunning().length > 0) return
     if (bgManager.hasCompleted()) return
     if (cronManager.hasQueue()) return
@@ -418,7 +418,7 @@ async function main(): Promise<void> {
     let query: string
     try {
       query = await new Promise<string>((resolve, reject) => {
-        rl.question('\x1b[36ms16 >> \x1b[0m', (answer) => {
+        rl.question('\x1b[36ms17 >> \x1b[0m', (answer) => {
           if (answer === undefined) reject(new Error('EOF'))
           else resolve(answer)
         })

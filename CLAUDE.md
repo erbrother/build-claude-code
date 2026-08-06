@@ -67,9 +67,8 @@ build-claude-code/
 │   │   └── cron.ts        # s14: 定时调度
 │   ├── team/
 │   │   ├── message-bus.ts # s15: 消息总线
-│   │   ├── teammate.ts    # s15: 队友代理
+│   │   ├── teammate.ts    # s15/s16/s17: 队友代理（rounds/idle/autonomous 三种模式）
 │   │   ├── protocols.ts   # s16: 协议
-│   │   ├── autonomous.ts  # s17: 自主代理
 │   │   └── worktree.ts    # s18: 工作树隔离
 │   ├── plugin/
 │   │   └── mcp.ts         # s19: MCP 插件
