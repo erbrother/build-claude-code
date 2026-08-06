@@ -218,11 +218,14 @@ async function runAgentTurn(ctx: SessionContext): Promise<void> {
       }
     }
 
-    // 收集本轮后台通知，合入同一条 user 消息
+    // 收集本轮后台通知，合并进同一条 user 消息
+    // 注意顺序：tool_result 必须紧跟对应的 tool_use（API 硬性要求），
+    // 通知文本只能放 tool_result 之后，unshift 到最前会导致
+    // "tool_use ids were found without tool_result blocks" 400 错误
     const bgNotifications = ctx.bgManager.collectResults()
     if (bgNotifications.length > 0) {
       for (const notif of bgNotifications) {
-        results.unshift({ type: 'text', text: notif })
+        results.push({ type: 'text', text: notif })
       }
     }
 

@@ -28,11 +28,14 @@ export interface BackgroundTask {
 // 常量
 // ============================================================================
 
-/** 慢操作关键词（启发式兜底用） */
+/**
+ * 慢操作关键词（启发式兜底用）
+ * 注意：不要用裸 "test"——PowerShell 的 Test-Path / -Test 会误判成后台任务，
+ * 导致普通命令被异步执行、结果走通知通道。用更精确的命令级匹配。
+ */
 const SLOW_KEYWORDS = [
   'install',
   'build',
-  'test',
   'deploy',
   'compile',
   'docker',
@@ -40,6 +43,9 @@ const SLOW_KEYWORDS = [
   'npm',
   'cargo',
   'pytest',
+  'npm test',
+  'pnpm test',
+  'yarn test',
   'make',
 ]
 

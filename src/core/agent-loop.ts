@@ -176,8 +176,10 @@ export async function agentLoop(messages: Message[], options: AgentLoopOptions):
         todoManager.noteRoundWithoutUpdate()
         const reminder = todoManager.reminder()
         if (reminder) {
-          // 提醒插入到 results 开头
-          results.unshift({ type: 'text', text: reminder })
+          // 提醒追加到 results 末尾，不能 unshift 到最前——
+          // tool_result 必须紧跟对应 tool_use（API 硬性要求），
+          // text 块插前面会导致 400 "tool_use without tool_result"
+          results.push({ type: 'text', text: reminder })
           console.log(`\x1b[35m${reminder}\x1b[0m`)
         }
       }
