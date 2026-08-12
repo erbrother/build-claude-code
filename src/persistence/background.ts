@@ -41,6 +41,8 @@ const SLOW_KEYWORDS = [
   'docker',
   'pip',
   'npm',
+  'pnpm',
+  'yarn',
   'cargo',
   'pytest',
   'npm test',
@@ -82,7 +84,35 @@ export class BackgroundManager {
       return false
     }
     const cmd = (toolInput.command as string).toLowerCase()
-    return SLOW_KEYWORDS.some((kw) => cmd.includes(kw))
+    return this.isSlowCommand(cmd)
+  }
+
+  /**
+   * 命令是否以慢操作关键词开头（启发式兜底）
+   *
+   * 为什么不能子串匹配？命令里可能夹着路径/文件名：
+   *   "cd /d D:\\myCode\\build-claude-code && git log --oneline -20 2>nul"
+   *   → includes("build") 误命中路径 build-claude-code → git log 被当成后台任务
+   *
+   * 正确做法：先按命令分隔符（&& || ; | 换行 (）拆成子命令片段，
+   * 关键词必须出现在片段开头（前面只能是空白）——"以 build 开头的命令"才算慢操作，
+   * "路径里含 build"不算。片段开头也保证了 cd xxx && npm install 这类复合命令
+   * 第二段仍能正确命中。
+   */
+  private isSlowCommand(cmd: string): boolean {
+    const segments = cmd.split(/&&|\|\||;|\||\n|\(/)
+    for (const segment of segments) {
+      const trimmed = segment.trimStart()
+      for (const kw of SLOW_KEYWORDS) {
+        if (!trimmed.startsWith(kw)) continue
+        // 关键词后必须是空白/斜杠/行尾，防止 "build-claude-code" 误配 "build"
+        const rest = trimmed.slice(kw.length)
+        if (rest === '' || /^[\s/\\]/.test(rest)) {
+          return true
+        }
+      }
+    }
+    return false
   }
 
   /**

@@ -146,7 +146,7 @@ async function runAgentTurn(ctx: SessionContext) {
         // 后台路径：spawn 子进程，返回占位 tool_result
         const bgId = ctx.bgManager.startTask(toolBlock.name, toolInput)
         ctx.ensureQueue() // 有后台任务了，确保定时器在跑
-        results.push({
+        results.unshift({
           type: 'tool_result' as const,
           tool_use_id: toolBlock.id,
           content: `[Background task ${bgId} started] Result will be available when complete.`,
@@ -162,7 +162,7 @@ async function runAgentTurn(ctx: SessionContext) {
         }
         console.log(`\x1b[36m> ${toolBlock.name}\x1b[0m`)
         console.log(output.slice(0, 300))
-        results.push({
+        results.unshift({
           type: 'tool_result' as const,
           tool_use_id: toolBlock.id,
           content: output,
