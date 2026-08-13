@@ -189,6 +189,20 @@ export class TaskManager {
   }
 
   /**
+   * 绑定任务到 worktree（s18）：只写 worktree 字段，保持 pending
+   * 为什么保持 pending？绑定发生在任务被认领之前——worktree 先建好，
+   * 任务留在板上等队友自动认领；队友认领后才知道该在哪个目录干活。
+   */
+  async bindWorktree(taskId: string, worktreeName: string): Promise<string> {
+    const task = await this.load(taskId)
+    task.worktree = worktreeName
+    task.updatedAt = Math.floor(Date.now() / 1000)
+    await this.save(task)
+    console.log(`  \x1b[33m[bind] ${task.subject} → worktree:${worktreeName}\x1b[0m`)
+    return `Bound ${taskId} to worktree '${worktreeName}'`
+  }
+
+  /**
    * 完成任务：in_progress → completed
    * 完成后报告哪些下游任务被解锁
    * 对标原项目 complete_task()
@@ -244,7 +258,8 @@ export class TaskManager {
               : '?'
       const deps = t.blockedBy.length > 0 ? ` (blockedBy: ${t.blockedBy.join(', ')})` : ''
       const owner = t.owner ? ` [${t.owner}]` : ''
-      lines.push(`  ${icon} ${t.id}: ${t.subject} [${t.status}]${owner}${deps}`)
+      const wt = t.worktree ? ` (wt:${t.worktree})` : ''
+      lines.push(`  ${icon} ${t.id}: ${t.subject} [${t.status}]${owner}${deps}${wt}`)
     }
     return lines.join('\n')
   }

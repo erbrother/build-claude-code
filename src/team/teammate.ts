@@ -18,11 +18,13 @@
 
 import { exec } from 'node:child_process'
 import { promisify } from 'node:util'
+import path from 'node:path'
 import { client, MODEL, WORKDIR, hasToolUseBlocks } from '../core/agent-loop'
 import { runRead, runWrite } from '../core/tools'
 import { MessageBus } from './message-bus'
 import type { BusMessage } from './message-bus'
 import { ProtocolManager } from './protocols'
+import { WORKTREES_DIR } from './worktree'
 import type { TaskManager } from '../persistence/task-manager'
 import type { ContentBlock, ToolDefinition, ToolHandler } from '../core/types'
 
@@ -459,6 +461,7 @@ export class TeammateManager {
       `You are '${name}', a ${role}. ` +
       'Use tools to complete tasks. ' +
       'You can list and claim tasks from the board. ' +
+      'If a task has a worktree, work in that directory. ' +
       'Check inbox for protocol messages. ' +
       "Send results via send_message to 'lead'."
 
@@ -466,12 +469,18 @@ export class TeammateManager {
       { role: 'user', content: prompt },
     ]
 
+    // s18: 当前绑定的 worktree 路径（认领带 worktree 的任务后设置）
+    let wtCwd: string | null = null
+
     // autonomous 模式 = 基础工具 + submit_plan + 任务板工具（共 8 个）
     const tools = [...TEAMMATE_TOOLS, SUBMIT_PLAN_TOOL, ...TEAMMATE_TASK_TOOLS]
     const handlers: Record<string, ToolHandler> = {
-      bash: this.runBash,
-      read_file: runRead,
-      write_file: runWrite,
+      // s18: bash/read/write 在绑定 worktree 的目录里执行
+      bash: async (input) => this.runBashIn(input, wtCwd ?? undefined),
+      read_file: async (input) =>
+        runRead({ ...input, path: this.wtPath(input.path as string, wtCwd) }),
+      write_file: async (input) =>
+        runWrite({ ...input, path: this.wtPath(input.path as string, wtCwd) }),
       send_message: (input) => {
         this.bus.send(name, input.to as string, input.content as string)
         return 'Sent'
@@ -488,14 +497,28 @@ export class TeammateManager {
         const tasks = await taskManager.listAll()
         if (tasks.length === 0) return 'No tasks.'
         return tasks
-          .map((t) => `  ${t.id}: ${t.subject} [${t.status}]${t.owner ? ` (${t.owner})` : ''}`)
+          .map(
+            (t) =>
+              `  ${t.id}: ${t.subject} [${t.status}]${t.owner ? ` (${t.owner})` : ''}${
+                t.worktree ? ` (wt:${t.worktree})` : ''
+              }`,
+          )
           .join('\n')
       },
       claim_task: async (input) => {
-        return taskManager.claimTask(input.task_id as string, name)
+        const taskId = input.task_id as string
+        const result = await taskManager.claimTask(taskId, name)
+        // 认领成功：如果任务绑定了 worktree，切换 cwd
+        if (result.startsWith('Claimed')) {
+          const task = await taskManager.get(taskId)
+          wtCwd = task.worktree ? path.join(WORKTREES_DIR, task.worktree) : null
+        }
+        return result
       },
       complete_task: async (input) => {
-        return taskManager.completeTask(input.task_id as string)
+        const result = await taskManager.completeTask(input.task_id as string)
+        wtCwd = null // 干完了，回到默认目录
+        return result
       },
     }
 
@@ -552,11 +575,15 @@ export class TeammateManager {
       if (shutdown) break
 
       // ── IDLE 阶段（s17）：扫描收件箱 + 任务板 ──
-      const idleResult = await this.idlePoll(name, messages)
+      const { result: idleResult, claimedTaskId } = await this.idlePoll(name, messages)
       if (idleResult === 'shutdown' || idleResult === 'timeout') {
         break
       }
-      // idleResult === 'work' → 回到 WORK 阶段
+      // idleResult === 'work' → 回到 WORK 阶段；认领了带 worktree 的任务则切换 cwd
+      if (claimedTaskId) {
+        const task = await taskManager.get(claimedTaskId)
+        wtCwd = task.worktree ? path.join(WORKTREES_DIR, task.worktree) : null
+      }
     }
 
     // 提取最后的文本作为总结，汇报给 Lead
@@ -568,7 +595,7 @@ export class TeammateManager {
 
   /**
    * IDLE 阶段轮询：收件箱 + 任务板双源
-   * 返回 'work'（有新工作）、'shutdown'（收到关闭协议）、'timeout'（无事件超时）
+   * 返回 { result: 'work' | 'shutdown' | 'timeout', claimedTaskId?: string }
    *
    * 顺序很重要：先收件箱（Lead 指令优先），再任务板（自主认领）。
    * 收件箱里的 shutdown_request 必须最先处理——Lead 要关人，不能让它等。
@@ -576,7 +603,7 @@ export class TeammateManager {
   private async idlePoll(
     name: string,
     messages: { role: 'user' | 'assistant'; content: unknown }[],
-  ): Promise<'work' | 'shutdown' | 'timeout'> {
+  ): Promise<{ result: 'work' | 'shutdown' | 'timeout'; claimedTaskId?: string }> {
     const taskManager = this.options.taskManager!
     const rounds = AUTONOMOUS_IDLE_TIMEOUT / AUTONOMOUS_IDLE_POLL_INTERVAL
 
@@ -589,7 +616,7 @@ export class TeammateManager {
         const nonProtocol = this.dispatchInbox(name, inbox, messages)
         if (nonProtocol === null) {
           console.log(`  \x1b[35m[protocol] ${name} approved shutdown in idle\x1b[0m`)
-          return 'shutdown'
+          return { result: 'shutdown' }
         }
         if (nonProtocol.length > 0) {
           messages.push({
@@ -597,7 +624,7 @@ export class TeammateManager {
             content: `<inbox>${JSON.stringify(nonProtocol)}</inbox>`,
           })
           console.log(`  \x1b[36m[idle] ${name} found inbox messages\x1b[0m`)
-          return 'work'
+          return { result: 'work' }
         }
         // 全是协议消息且未触发停止（如 plan_approval_response）→ 继续轮询
       }
@@ -608,19 +635,23 @@ export class TeammateManager {
         const task = unclaimed[0]
         const result = await taskManager.claimTask(task.id, name)
         if (result.startsWith('Claimed')) {
+          // s18: 注入 <auto-claimed> 时带上 worktree 目录提示
+          const wtInfo = task.worktree
+            ? `\nWork directory: ${path.join(WORKTREES_DIR, task.worktree)}`
+            : ''
           messages.push({
             role: 'user',
-            content: `<auto-claimed>Task ${task.id}: ${task.subject}</auto-claimed>`,
+            content: `<auto-claimed>Task ${task.id}: ${task.subject}${wtInfo}</auto-claimed>`,
           })
           console.log(`  \x1b[32m[idle] ${name} auto-claimed: ${task.subject}\x1b[0m`)
-          return 'work'
+          return { result: 'work', claimedTaskId: task.id }
         }
         console.log(`  \x1b[33m[idle] ${name} claim failed: ${result}\x1b[0m`)
       }
     }
 
     console.log(`  \x1b[31m[idle] ${name} timeout (${AUTONOMOUS_IDLE_TIMEOUT / 1000}s)\x1b[0m`)
-    return 'timeout'
+    return { result: 'timeout' }
   }
 
   /**
@@ -728,19 +759,24 @@ export class TeammateManager {
   }
 
   /**
-   * 队友的 bash：异步版本
+   * 队友的 bash：异步版本（无 worktree 时委托给 runBashIn）
+   */
+  private runBash: ToolHandler = (input) => this.runBashIn(input)
+
+  /**
+   * 队友的 bash：异步版本，支持指定 cwd（s18: worktree 目录）
    *
    * 为什么不能复用 core/tools.ts 的 runBash（execSync）？
    * Node.js 单线程：execSync 会阻塞整个事件循环，
    * 队友跑 "npm install" 时 Lead 的 REPL、queue processor 全部卡死。
    * Python 版队友在独立线程里跑，execSync 等价物只阻塞那个线程。
    */
-  private runBash: ToolHandler = async (input) => {
+  private async runBashIn(input: Record<string, unknown>, cwd?: string): Promise<string> {
     const command = input.command as string
     try {
       const shell = process.platform === 'win32' ? 'powershell.exe' : undefined
       const { stdout, stderr } = await execAsync(command, {
-        cwd: WORKDIR,
+        cwd: cwd ?? WORKDIR,
         timeout: BASH_TIMEOUT,
         maxBuffer: 50 * 1024 * 1024,
         shell,
@@ -752,6 +788,20 @@ export class TeammateManager {
       const out = ((err.stdout || '') + (err.stderr || '')).trim()
       return (out || `Error: ${err.message}`).slice(0, OUTPUT_LIMIT)
     }
+  }
+
+  /**
+   * s18: 把相对路径映射到 worktree 目录
+   * 绑定了 worktree 时在 worktree 里解析；否则用原始相对路径（主仓库）
+   * runRead/runWrite 内部的 safePath 会按 WORKDIR 解析，所以这里直接拼绝对路径
+   */
+  private wtPath(relativePath: string, wtCwd: string | null): string {
+    if (!wtCwd) return relativePath
+    const resolved = path.resolve(wtCwd, relativePath)
+    if (!resolved.startsWith(wtCwd)) {
+      throw new Error(`Path escapes worktree: ${relativePath}`)
+    }
+    return resolved
   }
 
   /**

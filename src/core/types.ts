@@ -131,6 +131,7 @@ export interface Task {
   blockedBy: string[] // 非可选，默认 []
   createdAt: number // 创建时间戳
   updatedAt: number // 更新时间戳
+  worktree?: string // s18: 绑定的 worktree 名称
 }
 
 // ============================================================================
