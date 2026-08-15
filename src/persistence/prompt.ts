@@ -426,6 +426,15 @@ export class SystemPromptBuilder {
     this.stableCache = null
   }
 
+  /**
+   * s19: 运行时更新工具列表（MCP 连接后工具池变化）
+   * 更新后自动失效缓存，下次 build() 时重新生成工具清单
+   */
+  updateTools(tools: ToolDefinition[]): void {
+    this.tools = tools
+    this.invalidateCache()
+  }
+
   // ==========================================================================
   // 组装
   // ==========================================================================

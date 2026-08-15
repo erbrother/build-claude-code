@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "docs": {
+      "command": "npx",
+      "args": ["tsx", "src/plugin/mcp-servers/docs-server.ts"]
+    },
+    "deploy": {
+      "command": "npx",
+      "args": ["tsx", "src/plugin/mcp-servers/deploy-server.ts"]
+    }
+  }
+}
