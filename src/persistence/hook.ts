@@ -90,8 +90,10 @@ export class HookManager {
     // 初始化空的 Hook 存储
     this.hooks = {
       SessionStart: [],
+      UserPromptSubmit: [],
       PreToolUse: [],
       PostToolUse: [],
+      Stop: [],
     }
     this.sdkMode = sdkMode
 
@@ -116,7 +118,13 @@ export class HookManager {
 
       // 从 config.hooks 中读取各事件的 Hook
       const hooksConfig = config.hooks || {}
-      for (const event of ['SessionStart', 'PreToolUse', 'PostToolUse'] as HookEvent[]) {
+      for (const event of [
+        'SessionStart',
+        'UserPromptSubmit',
+        'PreToolUse',
+        'PostToolUse',
+        'Stop',
+      ] as HookEvent[]) {
         if (Array.isArray(hooksConfig[event])) {
           this.hooks[event] = hooksConfig[event]
         }

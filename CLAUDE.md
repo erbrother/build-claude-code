@@ -72,13 +72,12 @@ build-claude-code/
 │   │   └── worktree.ts    # s18: 工作树隔离
 │   ├── plugin/
 │   │   └── mcp.ts         # s19: MCP 插件
-│   ├── full/
-│   │   └── agent.ts       # s_full: 综合实现
 │   ├── sessions/          # 各 session 入口
 │   │   ├── s01-agent-loop.ts
 │   │   ├── s02-tool-use.ts
 │   │   ├── ...
-│   │   └── s19-mcp-plugin.ts
+│   │   ├── s19-mcp-plugin.ts
+│   │   └── s-full-agent.ts # s_full: 综合实现（所有机制整合）
 │   └── cli/
 │       └── repl.ts        # REPL 交互界面
 ├── learn/

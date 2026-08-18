@@ -113,6 +113,65 @@ export const runEdit: ToolHandler = async (input) => {
 }
 
 // ============================================================================
+// glob 工具（s20 综合版）
+// ============================================================================
+
+/** 把 glob 模式转成正则（支持 ** 任意层级、* 单层任意、? 单字符） */
+function globToRegex(pattern: string): RegExp {
+  let re = ''
+  for (let i = 0; i < pattern.length; i++) {
+    const c = pattern[i]
+    if (c === '*') {
+      if (pattern[i + 1] === '*') {
+        re += '.*' // ** 匹配任意层级（含斜杠）
+        i++
+      } else {
+        re += '[^/]*' // * 只匹配单层内字符
+      }
+    } else if (c === '?') {
+      re += '[^/]'
+    } else if ('.+^$()[]{}|\\'.includes(c)) {
+      re += '\\' + c
+    } else {
+      re += c
+    }
+  }
+  return new RegExp(`^${re}$`)
+}
+
+/** glob 遍历时跳过的目录（避免钻进依赖/构建产物） */
+const GLOB_IGNORE_DIRS = new Set(['node_modules', '.git', 'dist', '.worktrees', '.tasks'])
+
+/** 递归遍历目录，收集匹配 pattern 的文件相对路径 */
+async function walkGlob(dir: string, regex: RegExp, base: string, out: string[]): Promise<void> {
+  const entries = await fs.readdir(dir, { withFileTypes: true })
+  for (const entry of entries) {
+    if (entry.isDirectory() && GLOB_IGNORE_DIRS.has(entry.name)) {
+      continue
+    }
+    const full = path.join(dir, entry.name)
+    const rel = path.relative(base, full).replace(/\\/g, '/')
+    if (entry.isDirectory()) {
+      await walkGlob(full, regex, base, out)
+    } else if (regex.test(rel)) {
+      out.push(rel)
+    }
+  }
+}
+
+export const runGlob: ToolHandler = async (input) => {
+  const pattern = input.pattern as string
+  try {
+    const results: string[] = []
+    await walkGlob(WORKDIR, globToRegex(pattern), WORKDIR, results)
+    results.sort()
+    return results.length > 0 ? results.join('\n') : '(no matches)'
+  } catch (error) {
+    return `Error: ${error}`
+  }
+}
+
+// ============================================================================
 // 工具定义
 // ============================================================================
 
@@ -197,6 +256,18 @@ export const BASE_TOOLS: ToolDefinition[] = [
       required: ['name', 'description', 'type', 'content'],
     },
   },
+  {
+    name: 'glob',
+    description:
+      'Find files matching a glob pattern (e.g. "**/*.ts", "src/**/*.md"). Returns newline-separated relative paths.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        pattern: { type: 'string', description: 'Glob pattern to match' },
+      },
+      required: ['pattern'],
+    },
+  },
 ]
 
 export const BASE_HANDLERS: Record<string, ToolHandler> = {
@@ -204,4 +275,5 @@ export const BASE_HANDLERS: Record<string, ToolHandler> = {
   read_file: runRead,
   write_file: runWrite,
   edit_file: runEdit,
+  glob: runGlob,
 }

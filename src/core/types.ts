@@ -214,7 +214,7 @@ export interface ParsedMemory {
 // ============================================================================
 
 /** Hook 事件名（什么时候触发） */
-export type HookEvent = 'SessionStart' | 'PreToolUse' | 'PostToolUse'
+export type HookEvent = 'SessionStart' | 'UserPromptSubmit' | 'PreToolUse' | 'PostToolUse' | 'Stop'
 
 /** 单个 Hook 的定义 */
 export interface HookDefinition {
